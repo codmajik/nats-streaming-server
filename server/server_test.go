@@ -23,6 +23,8 @@ import (
 	"github.com/nats-io/go-nats"
 	"github.com/nats-io/go-nats-streaming"
 	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/nats-streaming-server/logger"
+	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/nuid"
 )
@@ -38,7 +40,10 @@ type tLogger interface {
 	Errorf(format string, args ...interface{})
 }
 
-var defaultDataStore string
+var (
+	defaultDataStore string
+	testLogger       logger.Logger
+)
 
 func init() {
 	tmpDir, err := ioutil.TempDir(".", "data_server_")
@@ -50,9 +55,12 @@ func init() {
 	}
 	defaultDataStore = tmpDir
 	// Set debug and trace for this file.
-	setDebugAndTraceToDefaultOptions(true)
+	defaultOptions.Trace = true
+	defaultOptions.Debug = true
 	// For FT tests, reduce the HB/Timeout intervals
 	setFTTestsHBInterval()
+	// Dummy/no-op Logger
+	testLogger = logger.NewStanLogger()
 }
 
 func stackFatalf(t tLogger, f string, args ...interface{}) {
@@ -248,7 +256,7 @@ func RunServerWithDebugTrace(opts *Options, enableDebug, enableTrace bool) (*Sta
 	if opts == nil {
 		sOpts = GetDefaultOptions()
 	} else {
-		sOpts = opts
+		sOpts = opts.Clone()
 	}
 
 	nOpts := natsd.Options{}
@@ -258,9 +266,8 @@ func RunServerWithDebugTrace(opts *Options, enableDebug, enableTrace bool) (*Sta
 	nOpts.NoLog = false
 	nOpts.NoSigs = true
 
-	ConfigureLogger(sOpts, &nOpts)
-
-	return RunServerWithOpts(sOpts, nil)
+	sOpts.EnableLogging = true
+	return RunServerWithOpts(sOpts, &nOpts)
 }
 
 func TestRunServer(t *testing.T) {
@@ -287,6 +294,99 @@ func TestRunServer(t *testing.T) {
 	defer s.Shutdown()
 }
 
+type dummyLogger struct {
+	msg string
+}
+
+func (d *dummyLogger) Noticef(format string, args ...interface{}) {
+	d.msg = fmt.Sprintf(format, args...)
+}
+
+func (d *dummyLogger) Debugf(format string, args ...interface{}) {
+	d.msg = fmt.Sprintf(format, args...)
+}
+
+func (d *dummyLogger) Tracef(format string, args ...interface{}) {
+	d.msg = fmt.Sprintf(format, args...)
+}
+
+func (d *dummyLogger) Errorf(format string, args ...interface{}) {
+	d.msg = fmt.Sprintf(format, args...)
+}
+
+func (d *dummyLogger) Fatalf(format string, args ...interface{}) {
+	d.msg = fmt.Sprintf(format, args...)
+}
+
+func TestRunServerFailureLogsCause(t *testing.T) {
+	d := &dummyLogger{}
+
+	sOpts := GetDefaultOptions()
+	sOpts.NATSServerURL = "nats://localhost:4444"
+	sOpts.CustomLogger = d
+
+	// We expect the server to fail to start
+	s, err := RunServerWithOpts(sOpts, nil)
+	if err == nil {
+		s.Shutdown()
+		t.Fatal("Expected error, got none")
+	}
+	// We should get a trace in the log
+	if !strings.Contains(d.msg, "available for connection") {
+		t.Fatalf("Expected to get a cause as invalid connection, got: %v", d.msg)
+	}
+}
+
+func TestServerLoggerDebugAndTrace(t *testing.T) {
+	sOpts := GetDefaultOptions()
+	sOpts.EnableLogging = true
+	sOpts.Debug = true
+	sOpts.Trace = true
+
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	defer func() {
+		os.Stderr = oldStderr
+		r.Close()
+	}()
+	os.Stderr = w
+	done := make(chan bool, 1)
+	buf := make([]byte, 1024)
+	out := make([]byte, 0)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				n, _ := r.Read(buf)
+				out = append(out, buf[:n]...)
+			}
+		}
+	}()
+	s, err := RunServerWithOpts(sOpts, nil)
+	if err != nil {
+		t.Fatalf("Error running server: %v", err)
+	}
+	s.Shutdown()
+	// Signal that we are done (the channel is buffered)
+	done <- true
+	// If the go routine is sitting on a read, make it break out
+	// (calling r.Close() would produce races)
+	w.Write([]byte("*"))
+
+	wg.Wait()
+	// This is a bit dependent on what we currently print with
+	// trace and debug. May need to be adjusted.
+	str := string(out)
+	if !strings.Contains(str, "NATS conn opts") || !strings.Contains(str, "Publish subject") {
+		t.Fatalf("Expected tracing to include debug and trace, got %v", out)
+	}
+}
+
 func TestDefaultOptions(t *testing.T) {
 
 	opts := GetDefaultOptions()
@@ -295,6 +395,46 @@ func TestDefaultOptions(t *testing.T) {
 	opts2 := GetDefaultOptions()
 	if opts2.Debug == opts.Debug {
 		t.Fatal("Modified original default options")
+	}
+}
+
+func TestOptionsClone(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.Trace = true
+	opts.PerChannel = make(map[string]*stores.ChannelLimits)
+	cl := &stores.ChannelLimits{}
+	cl.MaxMsgs = 100
+	opts.PerChannel["foo"] = cl
+
+	clone := opts.Clone()
+	if !reflect.DeepEqual(opts, clone) {
+		t.Fatalf("Expected %#v, got %#v", opts, clone)
+	}
+
+	// Change a field
+	opts.Trace = false
+	// Expecting the clone to now be different
+	if reflect.DeepEqual(opts, clone) {
+		t.Fatal("Expected clone to be different after original changed, was not")
+	}
+	// Revert the field change
+	opts.Trace = true
+	// Should be same again
+	if !reflect.DeepEqual(opts, clone) {
+		t.Fatalf("Expected %#v, got %#v", opts, clone)
+	}
+	// Change a per channel's element
+	cl.MaxMsgs = 50
+	// Expecting the clone to now be different
+	if reflect.DeepEqual(opts, clone) {
+		t.Fatal("Expected clone to be different after original changed, was not")
+	}
+	// Add one channel to original
+	cl2 := *cl
+	opts.PerChannel["bar"] = &cl2
+	// Verify it is not added to the cloned.
+	if _, exist := clone.PerChannel["bar"]; exist {
+		t.Fatal("The channel bar should not be in the cloned options")
 	}
 }
 
@@ -4278,7 +4418,7 @@ func TestNonDurableRemovedFromStoreOnConnClose(t *testing.T) {
 	s.Shutdown()
 	// Open the store directly and verify that the sub record is not even found.
 	limits := stores.DefaultStoreLimits
-	store, err := stores.NewFileStore(defaultDataStore, &limits)
+	store, err := stores.NewFileStore(testLogger, defaultDataStore, &limits)
 	if err != nil {
 		t.Fatalf("Error opening file: %v", err)
 	}
@@ -6293,5 +6433,64 @@ func TestSingleConfFileForBoth(t *testing.T) {
 		cmd.Process.Kill()
 		cmd.Wait()
 		cmd = nil
+	}
+}
+
+func TestFileStoreMultipleShadowQSubs(t *testing.T) {
+	cleanupDatastore(t, defaultDataStore)
+	defer cleanupDatastore(t, defaultDataStore)
+
+	opts := getTestDefaultOptsForFileStore()
+	s := runServerWithOpts(t, opts, nil)
+	s.Shutdown()
+
+	fs, err := stores.NewFileStore(testLogger, defaultDataStore, &stores.DefaultStoreLimits)
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer fs.Close()
+	cs, _, err := fs.CreateChannel("foo", nil)
+	if err != nil {
+		t.Fatalf("Error creating channel: %v", err)
+	}
+	sub := spb.SubState{
+		ID:            1,
+		AckInbox:      nats.NewInbox(),
+		Inbox:         nats.NewInbox(),
+		AckWaitInSecs: 30,
+		MaxInFlight:   10,
+		LastSent:      1,
+		IsDurable:     true,
+		QGroup:        "dur:queue",
+	}
+	cs.Subs.CreateSub(&sub)
+	sub.ID = 2
+	sub.LastSent = 2
+	cs.Subs.CreateSub(&sub)
+	fs.Close()
+
+	// Should not panic
+	s = runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+	scs, err := s.lookupOrCreateChannel("foo")
+	if err != nil {
+		t.Fatalf("Error looking up channel: %v", err)
+	}
+	ss := scs.UserData.(*subStore)
+	ss.RLock()
+	qs := ss.qsubs["dur:queue"]
+	ss.RUnlock()
+	if qs == nil {
+		t.Fatal("Should have recovered queue group")
+	}
+	qs.RLock()
+	shadow := qs.shadow
+	lastSent := qs.lastSent
+	qs.RUnlock()
+	if shadow == nil {
+		t.Fatal("Should have recovered a shadow queue sub")
+	}
+	if shadow.ID != 2 || lastSent != 2 {
+		t.Fatalf("Recovered shadow queue sub should be ID 2, lastSent 2, got %v, %v", shadow.ID, lastSent)
 	}
 }

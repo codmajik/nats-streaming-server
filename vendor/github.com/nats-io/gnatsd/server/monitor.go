@@ -82,9 +82,11 @@ func (s *Server) HandleConnz(w http.ResponseWriter, r *http.Request) {
 	auth, _ := strconv.Atoi(r.URL.Query().Get("auth"))
 	subs, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 	c.Offset, _ = strconv.Atoi(r.URL.Query().Get("offset"))
+	if c.Offset < 0 {
+		c.Offset = 0
+	}
 	c.Limit, _ = strconv.Atoi(r.URL.Query().Get("limit"))
-
-	if c.Limit == 0 {
+	if c.Limit <= 0 {
 		c.Limit = DefaultConnListSize
 	}
 
@@ -240,7 +242,7 @@ func (s *Server) HandleConnz(w http.ResponseWriter, r *http.Request) {
 
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
-		Errorf("Error marshaling response to /connz request: %v", err)
+		s.Errorf("Error marshaling response to /connz request: %v", err)
 	}
 
 	// Handle response
@@ -331,7 +333,7 @@ func (s *Server) HandleRoutez(w http.ResponseWriter, r *http.Request) {
 
 	b, err := json.MarshalIndent(rs, "", "  ")
 	if err != nil {
-		Errorf("Error marshaling response to /routez request: %v", err)
+		s.Errorf("Error marshaling response to /routez request: %v", err)
 	}
 
 	// Handle response
@@ -347,7 +349,7 @@ func (s *Server) HandleSubsz(w http.ResponseWriter, r *http.Request) {
 	st := &Subsz{s.sl.Stats()}
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		Errorf("Error marshaling response to /subscriptionsz request: %v", err)
+		s.Errorf("Error marshaling response to /subscriptionsz request: %v", err)
 	}
 
 	// Handle response
@@ -455,7 +457,10 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 
 // HandleVarz will process HTTP requests for server information.
 func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
-	v := &Varz{Info: &s.info, Options: s.opts, MaxPayload: s.opts.MaxPayload, Start: s.start}
+	// Snapshot server options.
+	opts := s.getOpts()
+
+	v := &Varz{Info: &s.info, Options: opts, MaxPayload: opts.MaxPayload, Start: s.start}
 	v.Now = time.Now()
 	v.Uptime = myUptime(time.Since(s.start))
 	v.Port = v.Info.Port
@@ -484,7 +489,7 @@ func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
 
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		Errorf("Error marshaling response to /varz request: %v", err)
+		s.Errorf("Error marshaling response to /varz request: %v", err)
 	}
 
 	// Handle response
